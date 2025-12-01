@@ -1,6 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from qutip import basis, sigmam, mesolve, expect
+from qutip import basis, sigmam, mesolve, expect, qeye, ket2dm
 from scipy.special import gamma
 
 class BayesianT1Estimator:
@@ -50,15 +50,30 @@ class BayesianT1Estimator:
         # 현재 파라미터로 f_m 계산
         f_k = self._f_m(m, self.k, self.theta, tau)
         f_k_plus_1 = self._f_m(m, self.k + 1, self.theta, tau)
+
+        # 수치적 안정성 보정
+        eps = 1e-12
+        if f_k is None or np.isnan(f_k) or np.isinf(f_k):
+            f_k = eps
+        if f_k_plus_1 is None or np.isnan(f_k_plus_1) or np.isinf(f_k_plus_1):
+            f_k_plus_1 = eps
+        f_k = max(f_k, eps)
+        f_k_plus_1 = max(f_k_plus_1, eps)
         
         # Eq (5b): Update k
         # k_{i+1}^-1 = ...
         inv_k_new = (f_k_plus_1 / f_k) - 1
+        # inv_k_new가 너무 작거나 비양수이면 폭주 방지
+        if not np.isfinite(inv_k_new) or inv_k_new <= eps:
+            inv_k_new = eps
         k_new = 1.0 / inv_k_new
         
         # Eq (5a): Update theta (논문 표기 g^-1)
         # g_{i+1}^-1 = ... (논문에서 g는 theta에 해당)
         inv_theta_new = f_k_plus_1 - f_k
+        # theta는 양수여야 하므로 inv_theta_new는 양수로 클램프
+        if not np.isfinite(inv_theta_new) or inv_theta_new <= eps:
+            inv_theta_new = eps
         theta_new = 1.0 / inv_theta_new
         
         # 파라미터 갱신
@@ -93,17 +108,21 @@ beta = 0.14  # P(1|0) error
 estimator = BayesianT1Estimator(k_init=3.0, theta_init=450.0, alpha=alpha, beta=beta)
 
 # QuTiP 연산자 정의
-psi_excited = basis(2, 1) # Excited state (QuTiP에서 1이 excited라 가정, or 0 depends on mapping)
-# 보통 QuTiP: basis(2,0) -> [1,0] (Ground), basis(2,1) -> [0,1] (Excited) 라고 가정하고 진행
+psi_excited = basis(2, 0) # Excited state (QuTiP에서 0이 excited - sigmam()이 작용할 수 있도록)
+rho_excited = ket2dm(psi_excited)  # 초기 상태를 밀도 행렬로 사용
+# sigmam()이 |excited⟩ → |ground⟩ 전이를 일으키도록 basis(2,0)을 excited로 정의
 # 붕괴 연산자: sqrt(1/T1) * sigma_minus
 a = sigmam() 
-H = 0 * a # Hamiltonian (Free evolution)
-c_ops = [np.sqrt(1.0/true_T1) * a]
+H = 0 * qeye(2)  # Hamiltonian (Free evolution) - zero Hamiltonian as Qobj
+gamma = 1.0 / true_T1  # Decay rate (1/us)
+c_ops = [np.sqrt(gamma) * a]  # Collapse operator
 
 results_tau = []
 results_m = []
 
 print(f"True T1: {true_T1} us")
+print(f"Decay rate gamma: {gamma:.6f} /us")
+print(f"Expected decay after T1 time: {np.exp(-1):.4f} (should be ~0.368)")
 print("Starting Adaptive Bayesian Estimation...")
 
 # --- 2. 실험 루프 ---
@@ -116,14 +135,17 @@ for i in range(num_shots):
     
     # 2. Experiment (QuTiP): 큐비트 시간 발전 및 측정
     # 시간: 0 ~ tau
-    tlist = [0, tau]
+    print(f"Shot {i+1}: tau = {tau:.4f} us")
+    tlist = np.linspace(0, tau, 100)
     # mesolve로 밀도 행렬 계산 (Master Equation)
-    output = mesolve(H, psi_excited, tlist, c_ops, [])
+    output = mesolve(H, rho_excited, tlist, c_ops, e_ops=[])
     final_state = output.states[-1]
     
     # Excited state population (P_1) 계산
     # QuTiP basis(2,1)이 excited라면, projection operator는 basis(2,1)*basis(2,1).dag()
     p_excited = expect(psi_excited * psi_excited.dag(), final_state)
+    print(f"  -> P(excited) = {p_excited:.4f}, Expected = {np.exp(-tau/true_T1):.4f}")
+    print(f"  -> Final state diagonal: [{final_state.data.to_array()[0,0]:.4f}, {final_state.data.to_array()[1,1]:.4f}]")
     
     # 3. Measurement Simulation (Single Shot with SPAM)
     # 실제 물리적 붕괴 시뮬레이션
